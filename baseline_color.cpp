@@ -144,7 +144,7 @@ int luby_parallel_mis_color(const Graph &g,
             }
         }
 
-        if (!has_active) break; // ✅ all vertices colored
+        if (!has_active) break; 
 
         // ---- Step 2: select local-maxima vertices = MIS ----
         std::vector<char> inMIS(n, 0);
@@ -177,7 +177,7 @@ int luby_parallel_mis_color(const Graph &g,
         current_color++;
     }
 
-    return current_color; // number of colors used
+    return current_color;
 }
 
 std::vector<std::vector<int>> build_color_classes(const std::vector<int> &color,
