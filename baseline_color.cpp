@@ -1,12 +1,8 @@
-// g++ -O2 -std=c++17 -fopenmp baseline_color.cpp -o baseline
-//
-//   ./baseline -n 200 -p 0.05 -t 8 -i 20 -b   #Burke 
-//   ./baseline -n 200 -p 0.05 -t 8 -i 10 -l   #Laplacian
-//   ./baseline -n 200 -p 0.05 -t 8 -g         #greedy
-
 #include <bits/stdc++.h>
 #include <omp.h>
-
+// g++ -O2 -std=c++17 -fopenmp baseline_color.cpp -o baseline
+//   ./baseline -n 10000 -p 0.5 -t 8 -i 20 -b 
+//   ./baseline -n 10000 -p 0.5 -t 8 -i 20 -l 
 struct Graph {
     int n;
     std::vector<std::vector<int>> adj;
@@ -35,7 +31,6 @@ Graph generate_random_graph(int n, double p, unsigned seed = 42) {
     return g;
 }
 
-
 int greedy_color(const Graph &g, std::vector<int> &color) {
     int n = g.n;
     color.assign(n, -1);
@@ -54,9 +49,8 @@ int greedy_color(const Graph &g, std::vector<int> &color) {
             if (color[v] != -1) used[color[v]] = 0;
         }
     }
-    return max_color + 1; 
+    return max_color + 1;
 }
-
 
 int conflicts_if(const Graph &g, const std::vector<int> &color, int v, int c) {
     int cnt = 0;
@@ -172,29 +166,45 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "-n" && i + 1 < argc) {
-            n = std::stoi(argv[++i]);
-        } else if (arg == "-p" && i + 1 < argc) {
-            p = std::stod(argv[++i]);
-        } else if (arg == "-t" && i + 1 < argc) {
-            num_threads = std::stoi(argv[++i]);
-        } else if (arg == "-i" && i + 1 < argc) {
-            iters = std::stoi(argv[++i]);
+        if (arg == "-n") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: -n requires a value\n";
+                return 1;
+            }
+            n = std::atoi(argv[++i]);
+        } else if (arg == "-p") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: -p requires a value\n";
+                return 1;
+            }
+            p = std::atof(argv[++i]);
+        } else if (arg == "-t") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: -t requires a value\n";
+                return 1;
+            }
+            num_threads = std::atoi(argv[++i]);
+        } else if (arg == "-i") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: -i requires a value\n";
+                return 1;
+            }
+            iters = std::atoi(argv[++i]);
         } else if (arg == "-g") {
             if (mode != MODE_NONE) {
-                std::cerr << "Error\n";
+                std::cerr << "Error: specify only of -b, or -l.\n";
                 return 1;
             }
             mode = MODE_GREEDY;
         } else if (arg == "-b") {
             if (mode != MODE_NONE) {
-                std::cerr << "Error\n";
+                std::cerr << "Error: specify only one of -b, or -l.\n";
                 return 1;
             }
             mode = MODE_BURKE;
         } else if (arg == "-l") {
             if (mode != MODE_NONE) {
-                std::cerr << "Error\n";
+                std::cerr << "Error: specify only one of -b, or -l.\n";
                 return 1;
             }
             mode = MODE_LAPLACIAN;
@@ -210,56 +220,49 @@ int main(int argc, char **argv) {
 
     omp_set_num_threads(num_threads);
 
-    std::cout << "Generating random graph: n=" << n << " p=" << p
-              << " threads=" << num_threads << "\n";
+    std::cout << "Generating random graph: n=" << n << " p=" << p << " threads=" << num_threads << "\n";
     Graph g = generate_random_graph(n, p);
 
     std::vector<int> color;
+
     double t0 = omp_get_wtime();
     int num_colors = greedy_color(g, color);
     double t1 = omp_get_wtime();
+    double t_greedy = t1 - t0;
+    long long conf_after_greedy = total_conflicts(g, color);
 
-    std::cout << "Greedy coloring used " << num_colors
-              << " colors time: " << (t1 - t0) << " s\n";
-    long long conf = total_conflicts(g, color);
-    std::cout << "Conflicts after greedy: " << conf << "\n";
-
-    if (mode == MODE_GREEDY) {
-        return 0;
-    }
+    std::cout << "Greedy: colors=" << num_colors << "\n";
 
     if (mode == MODE_BURKE) {
-        std::cout << "Running Burke refinement for " << iters << " iterations\n";
         double t2 = omp_get_wtime();
         burke_refine(g, color, num_colors, iters);
         double t3 = omp_get_wtime();
+        double t_burke = t3 - t2;
+        long long conf_after_burke = total_conflicts(g, color);
 
-        long long conf_after = total_conflicts(g, color);
-        std::cout << "Burke refinement time: " << (t3 - t2) << " s\n";
+        std::cout << "Burke: time=" << t_burke
+                  << " s, conflicts=" << conf_after_burke << "\n";
+
         return 0;
     }
 
     if (mode == MODE_LAPLACIAN) {
-        std::cout << "Running Laplacian smoothing for " << iters << " iterations\n";
-
         auto color_classes = build_color_classes(color, num_colors);
 
-        std::vector<double> values(n);
+        int n_local = g.n;
+        std::vector<double> values(n_local);
         std::mt19937 rng(123);
         std::uniform_real_distribution<double> dist(0.0, 1.0);
-        for (int i = 0; i < n; ++i) values[i] = dist(rng);
+        for (int i = 0; i < n_local; ++i) values[i] = dist(rng);
 
         double t4 = omp_get_wtime();
         laplacian_smoothing_color_batches(g, color_classes, values, iters);
         double t5 = omp_get_wtime();
+        double t_lap = t5 - t4;
 
-        std::cout << "Laplacian smoothing time: " << (t5 - t4) << " s\n";
-        std::cout << "vertex values after smoothing (first 10):\n";
-        for (int i = 0; i < std::min(n, 10); ++i) {
-            std::cout << "v " << i << " = " << values[i] << "\n";
-        }
+        std::cout << "Laplacian: time=" << t_lap << " s\n";
         return 0;
     }
-    
+
     return 0;
 }
