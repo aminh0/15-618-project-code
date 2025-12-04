@@ -1,14 +1,15 @@
 #include <bits/stdc++.h>
 #include <omp.h>
 // g++ -O2 -std=c++17 -fopenmp baseline_color.cpp -o baseline
-// ./baseline -n 10000 -p 0.5 -t 8 -i 20 -g -B
+// ./baseline -n 10000 -p 0.5 -t 8 -i 20 -g -b -c 20
 
 //   -g   : sequential greedy_color
-//   -p   : speculative_parallel_greedy_color
+//   -gp   : speculative_parallel_greedy_color
 //   -lb   : luby_parallel_mis_color
 //
-//   -B   : Burke refinement kernel
-//   -L   : Laplacian smoothing kernel
+//   -b   : Burke refinement kernel
+//   -l   : Laplacian smoothing kernel
+//   -c   :  max color
 
 struct Graph {
     int n;
@@ -21,6 +22,17 @@ struct Graph {
         adj[u].push_back(v);
         adj[v].push_back(u);
     }
+};
+
+//memory access count
+struct Metrics {
+    long long color_edge_visits = 0;      // edges traversed during coloring
+    long long color_neigh_dist_sum = 0;   // sum |u - v| during coloring
+
+    long long lap_edge_visits = 0;        // edges traversed during Laplacian
+    long long lap_neigh_dist_sum = 0;     // sum |u - v| during Laplacian
+
+    double color_locality_score = 0.0;    // computed after coloring (per color class)
 };
 
 Graph generate_random_graph(int n, double p, unsigned seed = 42) {
@@ -39,7 +51,7 @@ Graph generate_random_graph(int n, double p, unsigned seed = 42) {
 }
 
 // ----------------- Sequential greedy coloring -----------------
-int greedy_color(const Graph &g, std::vector<int> &color) {
+int greedy_color(const Graph &g, std::vector<int> &color, Metrics &metrics) {
     int n = g.n;
     color.assign(n, -1);
     std::vector<char> used(n, 0);
@@ -47,6 +59,8 @@ int greedy_color(const Graph &g, std::vector<int> &color) {
     int max_color = -1;
     for (int u = 0; u < n; ++u) {
         for (int v : g.adj[u]) {
+            metrics.color_edge_visits++;
+            metrics.color_neigh_dist_sum += std::llabs((long long)u - (long long)v);
             if (color[v] != -1) used[color[v]] = 1;
         }
         int c = 0;
@@ -61,9 +75,7 @@ int greedy_color(const Graph &g, std::vector<int> &color) {
 }
 
 // ----------------- Speculative parallel greedy coloring -----------------
-int speculative_parallel_greedy_color(const Graph &g,
-                                      std::vector<int> &color,
-                                      int num_threads)
+int speculative_parallel_greedy_color(const Graph &g, std::vector<int> &color, int num_threads, Metrics &metrics)
 {
     int n = g.n;
     color.assign(n, -1);
@@ -88,6 +100,8 @@ int speculative_parallel_greedy_color(const Graph &g,
             std::vector<char> used(64, 0); // assume small chromatic number
 
             for (int v : g.adj[u]) {
+                metrics.color_edge_visits++;
+                metrics.color_neigh_dist_sum += std::llabs((long long)u - (long long)v);
                 int c = color[v];
                 if (c >= 0) {
                     if (c >= (int)used.size()) used.resize(c + 1, 0);
@@ -266,10 +280,46 @@ std::vector<std::vector<int>> build_color_classes(const std::vector<int> &color,
     return classes;
 }
 
-void laplacian_smoothing_color_batches(const Graph &g,
-                                       const std::vector<std::vector<int>> &color_classes,
-                                       std::vector<double> &values,
-                                       int num_iters)
+double compute_color_class_locality(const std::vector<int> &color, int num_colors) {
+    if (num_colors <= 0) return 0.0;
+
+    std::vector<std::vector<int>> classes(num_colors);
+    int n = (int)color.size();
+    for (int v = 0; v < n; ++v) {
+        int c = color[v];
+        if (c >= 0 && c < num_colors) {
+            classes[c].push_back(v);
+        }
+    }
+
+    double total_std = 0.0;
+    int nonempty = 0;
+
+    for (const auto &cls : classes) {
+        if (cls.size() <= 1) continue;  // 0 or 1 vertex => stddev = 0, skip
+
+        nonempty++;
+
+        double mean = 0.0;
+        for (int v : cls) mean += v;
+        mean /= (double)cls.size();
+
+        double var = 0.0;
+        for (int v : cls) {
+            double d = (double)v - mean;
+            var += d * d;
+        }
+        var /= (double)cls.size();
+
+        total_std += std::sqrt(var);
+    }
+
+    if (nonempty == 0) return 0.0;
+    return total_std / (double)nonempty;
+}
+
+
+void laplacian_smoothing_color_batches(const Graph &g, const std::vector<std::vector<int>> &color_classes, std::vector<double> &values, int num_iters, Metrics &metrics)
 {
     int n = g.n;
     std::vector<double> tmp(n);
@@ -292,6 +342,8 @@ void laplacian_smoothing_color_batches(const Graph &g,
 
                 double sum = 0.0;
                 for (int u : nbrs) {
+                    metrics.lap_edge_visits++;
+                    metrics.lap_neigh_dist_sum += std::llabs((long long)u - (long long)v);
                     sum += values[u];
                 }
                 tmp[v] = sum / (double)nbrs.size();
@@ -323,6 +375,9 @@ int main(int argc, char **argv) {
     int num_threads = 4;
     ColorMode color_mode = COLOR_NONE;
     KernelMode kernel_mode = KERNEL_NONE;
+    int max_colors = -1; // -1 = no limit
+
+    Metrics metrics;
 
     // ---- parse args ----
     for (int i = 1; i < argc; ++i) {
@@ -345,27 +400,37 @@ int main(int argc, char **argv) {
                 return 1;
             }
             color_mode = COLOR_GREEDY;
-        } else if (arg == "-gp") {      // NEW: parallel greedy flag
+        } else if (arg == "-gp") {
             if (color_mode != COLOR_NONE) {
                 std::cerr << "Error: choose only one of -g, -gp, -lb for coloring\n";
                 return 1;
             }
             color_mode = COLOR_SPECULATIVE;
+        } else if (arg == "-c") {
+        if (i + 1 >= argc) {
+            std::cerr << "Error: -c needs value\n";
+            return 1;
+        }
+        max_colors = std::atoi(argv[++i]);
+        if (max_colors <= 0) {
+            std::cerr << "Error: -c must be positive\n";
+            return 1;
+        }
         } else if (arg == "-lb") {       // Luby MIS coloring
             if (color_mode != COLOR_NONE) {
                 std::cerr << "Error: choose only one of -g, -gp, -lb for coloring\n";
                 return 1;
             }
             color_mode = COLOR_LUBY;
-        } else if (arg == "-B") {
+        } else if (arg == "-b") {
             if (kernel_mode != KERNEL_NONE) {
-                std::cerr << "Error: choose only one of -B, -L for kernel\n";
+                std::cerr << "Error: choose only one of -b, -l for kernel\n";
                 return 1;
             }
             kernel_mode = KERNEL_BURKE;
-        } else if (arg == "-L") {
+        } else if (arg == "-l") {
             if (kernel_mode != KERNEL_NONE) {
-                std::cerr << "Error: choose only one of -B, -L for kernel\n";
+                std::cerr << "Error: choose only one of -b, -l for kernel\n";
                 return 1;
             }
             kernel_mode = KERNEL_LAPLACIAN;
@@ -379,12 +444,12 @@ int main(int argc, char **argv) {
         color_mode == COLOR_NONE || kernel_mode == KERNEL_NONE) {
         std::cerr << "Usage:\n"
                   << "  ./baseline -n <nodes> -p <prob> -t <threads> -i <iters>\n"
-                  << "             (-g | -gp | -lb)  (-B | -L)\n"
+                  << "             (-g | -gp | -lb)  (-b | -l)\n"
                   << "    -g  : greedy (sequential) coloring\n"
                   << "    -gp : speculative parallel greedy coloring\n"
                   << "    -lb  : Luby MIS coloring\n"
-                  << "    -B  : Burke refinement kernel\n"
-                  << "    -L  : Laplacian smoothing kernel\n";
+                  << "    -b  : Burke refinement kernel\n"
+                  << "    -l  : Laplacian smoothing kernel\n";
         return 1;
     }
 
@@ -400,15 +465,22 @@ int main(int argc, char **argv) {
     double t0 = omp_get_wtime();
 
     if (color_mode == COLOR_GREEDY) {
-        num_colors = greedy_color(g, color);
+        num_colors = greedy_color(g, color, metrics);
     } else if (color_mode == COLOR_SPECULATIVE) {
-        num_colors = speculative_parallel_greedy_color(g, color, num_threads);
+        num_colors = speculative_parallel_greedy_color(g, color, num_threads, metrics);
     } else if (color_mode == COLOR_LUBY) {
         num_colors = luby_parallel_mis_color(g, color, num_threads);
     }
 
     double t1 = omp_get_wtime();
     double t_color = t1 - t0;
+
+    if (max_colors > 0 && num_colors > max_colors) {
+    for (int &c : color) {
+        if (c >= 0) c = c % max_colors;
+    }
+    num_colors = max_colors;
+    }
     long long conf_after = total_conflicts(g, color);
 
     std::cout << "Coloring: mode="
@@ -418,11 +490,8 @@ int main(int argc, char **argv) {
               << ", time=" << t_color
               << " s, conflicts=" << conf_after << "\n";
 
-    if (kernel_mode == KERNEL_BURKE && conf_after == 0) {
-    std::cout << "No conflict, Burke has nothing to fix - skipping.\n";
-    return 0;
-    }
-
+    double locality_before = compute_color_class_locality(color, num_colors);
+    metrics.color_locality_score = locality_before; 
     // ---- run kernel ----
     if (kernel_mode == KERNEL_BURKE) {
         double t2 = omp_get_wtime();
@@ -431,10 +500,37 @@ int main(int argc, char **argv) {
         double t_burke = t3 - t2;
         long long conf_after_burke = total_conflicts(g, color);
 
-        std::cout << "Burke kernel: time=" << t_burke
-                  << " s, conflicts=" << conf_after_burke << "\n";
+        double locality_after = compute_color_class_locality(color, num_colors);
+
+        std::cout << "Burke kernel: time=" << t_burke << " s, conflicts=" << conf_after_burke << "\n";
+        std::cout << "Color-class locality (before Burke): " << locality_before << "\n";
+        std::cout << "Color-class locality (after Burke):  " << locality_after  << "\n";
+        metrics.color_locality_score = locality_after;
+
     } else if (kernel_mode == KERNEL_LAPLACIAN) {
         auto color_classes = build_color_classes(color, num_colors);
+
+        double total_std = 0.0;
+        int nonempty = 0;
+        for (const auto &cls : color_classes) {
+            if (cls.empty()) continue;
+            nonempty++;
+            double mean = 0.0;
+            for (int v : cls) mean += v;
+            mean /= cls.size();
+            double var = 0.0;
+            for (int v : cls) {
+                double d = v - mean;
+                var += d * d;
+            }
+            var /= cls.size();
+            total_std += std::sqrt(var);
+        }
+        if (nonempty > 0) {
+            metrics.color_locality_score = total_std / nonempty;
+        } else {
+            metrics.color_locality_score = 0.0;
+        }
 
         int n_local = g.n;
         std::vector<double> values(n_local);
@@ -443,12 +539,23 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n_local; ++i) values[i] = dist(rng);
 
         double t4 = omp_get_wtime();
-        laplacian_smoothing_color_batches(g, color_classes, values, iters);
+        laplacian_smoothing_color_batches(g, color_classes, values, iters, metrics);
         double t5 = omp_get_wtime();
         double t_lap = t5 - t4;
 
         std::cout << "Laplacian kernel: time=" << t_lap << " s\n";
     }
+
+    std::cout << "=== Metrics ===\n";
+        if (metrics.color_edge_visits > 0) {
+            double avg_dist = (double)metrics.color_neigh_dist_sum / (double)metrics.color_edge_visits;
+            std::cout << "Coloring edge visits: " << metrics.color_edge_visits  << ", avg |u-v|: " << avg_dist << "\n";
+        }
+        if (metrics.lap_edge_visits > 0) {
+            double avg_dist_lap = (double)metrics.lap_neigh_dist_sum / (double)metrics.lap_edge_visits;
+            std::cout << "Laplacian edge visits: " << metrics.lap_edge_visits << ", avg |u-v|: " << avg_dist_lap << "\n";
+        }
+        std::cout << "Color-class locality score (avg stddev of vertex IDs per color): " << metrics.color_locality_score << "\n\n";
 
     return 0;
 }
