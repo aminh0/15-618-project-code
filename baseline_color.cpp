@@ -50,6 +50,45 @@ Graph generate_random_graph(int n, double p, unsigned seed = 42) {
     return g;
 }
 
+
+Graph generate_locality_graph(int n) {
+    Graph g(n);
+
+    const int W = 8; 
+    for (int u = 0; u < n; ++u) {
+        for (int d = 1; d <= W; ++d) {
+            int v = u + d;
+            if (v < n) g.add_edge(u, v);
+        }
+    }
+
+    const int CLUSTER_SIZE = 64; 
+
+    for (int start = 0; start < n; start += CLUSTER_SIZE) {
+        int end = std::min(start + CLUSTER_SIZE, n);
+
+        const int K = 4; 
+        for (int u = start; u < end; u += K) {
+            for (int v = u + K; v < end; v += K) {
+                g.add_edge(u, v);
+            }
+        }
+    }
+
+    for (int start = 0; start + CLUSTER_SIZE < n; start += CLUSTER_SIZE) {
+        int rep1 = start;
+        int rep2 = start + CLUSTER_SIZE;
+        if (rep2 < n) {
+            g.add_edge(rep1, rep2);       // chain clusters together
+            if (rep2 + CLUSTER_SIZE < n) // a diagonal jump for extra mixing
+                g.add_edge(rep1, rep2 + CLUSTER_SIZE);
+        }
+    }
+
+    return g;
+}
+
+
 // ----------------- Sequential greedy coloring -----------------
 int greedy_color(const Graph &g, std::vector<int> &color, Metrics &metrics) {
     int n = g.n;
@@ -232,40 +271,6 @@ long long total_conflicts(const Graph &g, const std::vector<int> &color) {
     return conflicts;
 }
 
-void burke_refine(const Graph &g, std::vector<int> &color, int num_colors, int max_iters)
-{
-    int n = g.n;
-    std::vector<int> new_color(n);
-
-    for (int iter = 0; iter < max_iters; ++iter) {
-        int changes = 0;
-
-        #pragma omp parallel for schedule(dynamic, 64) reduction(+:changes)
-        for (int v = 0; v < n; ++v) {
-            int cur_c = color[v];
-            int best_c = cur_c;
-            int best_conf = conflicts_if(g, color, v, cur_c);
-
-            for (int c = 0; c < num_colors; ++c) {
-                if (c == cur_c) continue;
-                int c_conf = conflicts_if(g, color, v, c);
-                if (c_conf < best_conf || (c_conf == best_conf && c < best_c)) {
-                    best_conf = c_conf;
-                    best_c = c;
-                }
-            }
-
-            new_color[v] = best_c;
-            if (best_c != cur_c) ++changes;
-        }
-
-        color.swap(new_color);
-
-        if (changes == 0) {
-            break;
-        }
-    }
-}
 
 // ----------------- Laplacian smoothing -----------------
 std::vector<std::vector<int>> build_color_classes(const std::vector<int> &color, int num_colors) {
@@ -296,7 +301,7 @@ double compute_color_class_locality(const std::vector<int> &color, int num_color
     int nonempty = 0;
 
     for (const auto &cls : classes) {
-        if (cls.size() <= 1) continue;  // 0 or 1 vertex => stddev = 0, skip
+        if (cls.size() <= 1) continue;
 
         nonempty++;
 
@@ -316,6 +321,74 @@ double compute_color_class_locality(const std::vector<int> &color, int num_color
 
     if (nonempty == 0) return 0.0;
     return total_std / (double)nonempty;
+}
+
+
+void burke_refine(const Graph &g,
+                  std::vector<int> &color,
+                  int num_colors,
+                  int max_iters)
+{
+    int n = g.n;
+    std::vector<int> new_color(n);
+
+    for (int iter = 0; iter < max_iters; ++iter) {
+        std::vector<long long> sum(num_colors, 0);
+        std::vector<int> count(num_colors, 0);
+
+        for (int v = 0; v < n; ++v) {
+            int c = color[v];
+            if (c >= 0 && c < num_colors) {
+                sum[c] += v;
+                count[c]++;
+            }
+        }
+
+        std::vector<double> mean(num_colors, -1.0);
+        for (int c = 0; c < num_colors; ++c) {
+            if (count[c] > 0) {
+                mean[c] = (double)sum[c] / (double)count[c];
+            }
+        }
+
+        int changes = 0;
+
+        #pragma omp parallel for schedule(dynamic, 64) reduction(+:changes)
+        for (int v = 0; v < n; ++v) {
+            int cur_c    = color[v];
+            int cur_conf = conflicts_if(g, color, v, cur_c);
+            double cur_dist = (cur_c >= 0 && cur_c < num_colors && mean[cur_c] >= 0.0)
+                              ? std::fabs((double)v - mean[cur_c])
+                              : 1e30;
+
+            int    best_c    = cur_c;
+            int    best_conf = cur_conf;
+            double best_dist = cur_dist;
+
+            for (int c = 0; c < num_colors; ++c) {
+                if (c == cur_c) continue;
+                if (mean[c] < 0.0) continue;  // empty colors
+
+                int c_conf = conflicts_if(g, color, v, c);
+                double dist = std::fabs((double)v - mean[c]);
+
+                if (c_conf < best_conf ||
+                    (c_conf == best_conf && dist < best_dist - 1e-9)) {
+                    best_conf = c_conf;
+                    best_c    = c;
+                    best_dist = dist;
+                }
+            }
+
+            new_color[v] = best_c;
+            if (best_c != cur_c) ++changes;
+        }
+
+
+        color.swap(new_color);
+
+        if (changes == 0) break; // local minimum reached
+    }
 }
 
 
@@ -455,9 +528,10 @@ int main(int argc, char **argv) {
 
     omp_set_num_threads(num_threads);
 
-    std::cout << "Generating random graph: n=" << n << " p=" << p
+    std::cout << "Generating locality graph: n=" << n << " p=" << p
               << " threads=" << num_threads << "\n";
-    Graph g = generate_random_graph(n, p);
+    Graph g = generate_locality_graph(n);
+    //Graph g = generate_random_graph(n, p);
 
     // ---- choose coloring algorithm ----
     std::vector<int> color;
@@ -476,9 +550,14 @@ int main(int argc, char **argv) {
     double t_color = t1 - t0;
 
     if (max_colors > 0 && num_colors > max_colors) {
-    for (int &c : color) {
-        if (c >= 0) c = c % max_colors;
-    }
+        for (int &c : color) {
+            if (c >= 0) {
+                int old_c = c;
+                int new_c = (int)((long long)old_c * max_colors / num_colors);
+                if (new_c >= max_colors) new_c = max_colors - 1;
+                c = new_c;
+            }
+        }
     num_colors = max_colors;
     }
     long long conf_after = total_conflicts(g, color);
