@@ -11,6 +11,9 @@
 //   -l   : Laplacian smoothing kernel
 //   -c   :  max color
 
+// -loc : non-random graph (to generate locality)
+// -rand: random graph
+
 struct Graph {
     int n;
     std::vector<std::vector<int>> adj;
@@ -441,6 +444,12 @@ enum KernelMode {
     KERNEL_LAPLACIAN
 };
 
+enum GraphMode {
+    GRAPH_LOCALITY = 0,
+    GRAPH_RANDOM
+};
+
+
 int main(int argc, char **argv) {
     int n = -1;
     double p = -1.0;
@@ -448,6 +457,7 @@ int main(int argc, char **argv) {
     int num_threads = 4;
     ColorMode color_mode = COLOR_NONE;
     KernelMode kernel_mode = KERNEL_NONE;
+    GraphMode graph_mode = GRAPH_RANDOM; 
     int max_colors = -1; // -1 = no limit
 
     Metrics metrics;
@@ -507,6 +517,10 @@ int main(int argc, char **argv) {
                 return 1;
             }
             kernel_mode = KERNEL_LAPLACIAN;
+        } else if (arg == "-loc") {
+            graph_mode = GRAPH_LOCALITY;
+        } else if (arg == "-rand") {
+            graph_mode = GRAPH_RANDOM;
         } else {
             std::cerr << "Unknown argument: " << arg << "\n";
             return 1;
@@ -528,10 +542,19 @@ int main(int argc, char **argv) {
 
     omp_set_num_threads(num_threads);
 
-    std::cout << "Generating locality graph: n=" << n << " p=" << p
-              << " threads=" << num_threads << "\n";
-    Graph g = generate_locality_graph(n);
-    //Graph g = generate_random_graph(n, p);
+    Graph g;
+
+    if (graph_mode == GRAPH_LOCALITY) {
+        std::cout << "Generating locality graph: n=" << n
+                  << " p=" << p
+                  << " threads=" << num_threads << "\n";
+        g = generate_locality_graph(n);
+    } else { // GRAPH_RANDOM
+        std::cout << "Generating random graph: n=" << n
+                  << " p=" << p
+                  << " threads=" << num_threads << "\n";
+        g = generate_random_graph(n, p);
+    }
 
     // ---- choose coloring algorithm ----
     std::vector<int> color;
